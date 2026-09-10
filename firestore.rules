@@ -1,0 +1,386 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      let profile = get(/databases/$(database)/documents/userProfiles/$(request.auth.uid)).data;
+      return profile != null && (profile.role == 'admin' || profile.isGlobalAdmin == true);
+    }
+
+    function isOnlyChangingOwnMapEntry(mapName, before, after, userId) {
+      return before.diff(after).affectedKeys().hasOnly([mapName]) &&
+             before[mapName].diff(after[mapName]).affectedKeys().hasOnly([userId]);
+    }
+
+    function isValidOrchestration(before, after) {
+      return before.participants == after.participants && (
+        (before.status == 'voting' && after.status == 'category_reveal' && before.gameData == null && after.gameData.keys().hasOnly(['category'])) ||
+        (before.status == 'category_reveal' && after.status == 'word_reveal' && before.gameData.keys().hasOnly(['category']) && after.gameData.keys().hasAll(['category', 'spyId', 'villagerWord', 'spyWord']) && before.gameData.category == after.gameData.category) ||
+        (before.status == 'result_tie' && after.status == 'pk_describing') ||
+        (before.status == 'pk_describing' && after.status == 'pk_describing') ||
+        (before.status == 'pk_describing' && after.status == 'pk_voting') ||
+        (before.status == 'pk_voting' && after.status == 'vote_reveal') ||
+        (
+          before.gameData != null && after.gameData != null &&
+          before.gameData.spyId == after.gameData.spyId &&
+          before.gameData.villagerWord == after.gameData.villagerWord
+        )
+      );
+    }
+    
+    function isNotBlocked(blockerId, blockeeId) {
+      let blockerProfile = get(/databases/$(database)/documents/userProfiles/$(blockerId)).data;
+      return blockerProfile == null ||
+             !('blockedUsers' in blockerProfile) ||
+             !(blockerProfile.blockedUsers is list) ||
+             !(blockeeId in blockerProfile.blockedUsers);
+    }
+
+    match /displayIdToUid/{displayId} {
+      allow get: if isSignedIn();
+      allow create: if request.resource.data.uid == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    match /global_music/{docId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn();
+      allow update, delete: if false; 
+    }
+
+    match /hallOfFame/{docId} {
+      allow read: if isSignedIn();
+      allow write: if false; 
+    }
+
+    match /hallOfFameVip/{docId} {
+      allow read: if isSignedIn();
+      allow write: if false; 
+    }
+
+    // FAMILY SYSTEM — All writes go through server APIs for security
+    match /families/{familyId} {
+      allow read: if isSignedIn();
+      allow write: if false; // Server-only writes via Admin SDK
+      
+      match /members/{memberId} {
+        allow read: if isSignedIn();
+        allow write: if false; // Server-only writes
+      }
+      
+      match /news/{newsId} {
+        allow read: if isSignedIn();
+        allow write: if false; // Server-only writes
+      }
+      
+      match /messages/{messageId} {
+        allow read: if isSignedIn() && exists(/databases/$(database)/documents/families/$(familyId)/members/$(request.auth.uid));
+        allow write: if isSignedIn() && exists(/databases/$(database)/documents/families/$(familyId)/members/$(request.auth.uid));
+      }
+
+      match /joinRequests/{requestId} {
+        allow read: if isSignedIn();
+        allow write: if false; // Server-only writes
+      }
+    }
+
+    match /userProfiles/{userId} {
+      allow read: if isSignedIn();
+      allow create: if request.auth.uid == userId && request.resource.data.id == userId;
+      
+      // ✅ SECURED: Users can update normal profile info (username, photo, bio, frame, fcmToken, etc.),
+      // but CANNOT self-modify coins, VIP status, progression, or moderation fields.
+      // All balance and level upgrades are securely handled exclusively by your backend Admin SDK!
+      allow update: if request.auth.uid == userId &&
+                      !request.resource.data.diff(resource.data).affectedKeys().hasAny([
+                        'coins', 'isVip', 'vipLevel', 'vipGrowthPts', 'vipExpiresAt',
+                        'relegationPtsAccumulated', 'relegationPeriodEnd', 'activePurchaseToken',
+                        'aura', 'auraToday', 'auraYesterday', 'textAura', 'xp', 'level',
+                        'isBanned', 'banReason', 'bannedAt', 'titles', 'bffs',
+                        'gamesPlayed', 'wins',
+                        'vipGrowthToday', 'vipGrowthYesterday',
+                        'lastDailyCoinsClaimDate', 'lastDailyXpClaimDate', 'loginStreak',
+                        'isOnline', 'lastActive',
+                        'ownedFrameIds', 'ownedFramesExpiry',
+                        'cpPartner', 'cpLevel', 'cpPoints', 'marriedAt', 'cpLove', 'cpBlessing', 'cpBackground', 'cpRingId', 'ownedRings'
+                      ]);
+                      
+      allow delete: if request.auth.uid == userId;
+
+      match /gameStats/{playerGameStatId} {
+        allow read, write: if request.auth.uid == userId;
+      }
+      
+      match /supporters/{supporterId} {
+        allow read: if isSignedIn();
+        // 🛑 STRICT SECURITY: Top Supporter leaderboards are updated exclusively by backend gift transactions (Admin SDK)!
+        allow write: if false; 
+      }
+
+      match /receivedGifts/{giftId} {
+        allow read: if isSignedIn();
+      }
+
+      match /visitors/{visitorId} {
+        allow read: if request.auth.uid == userId;
+        allow write: if isSignedIn() && request.auth.uid == visitorId;
+      }
+    }
+    
+    match /reports/{reportId} {
+      allow create: if isSignedIn() && request.resource.data.reporterId == request.auth.uid;
+      allow read, update, delete: if false;
+    }
+
+    match /supportTickets/{ticketId} {
+      allow create: if isSignedIn();
+      allow read, update: if isSignedIn() && (resource.data.playerId == request.auth.uid || isAdmin());
+      allow delete: if false;
+    }
+
+    match /ludoSessions/{ludoSessionId} {
+      allow get, list: if isSignedIn();
+      allow create: if request.resource.data.hostUserId == request.auth.uid;
+      allow delete: if false; 
+      
+      allow update: if isSignedIn() &&
+                      request.resource.data.hostUserId == resource.data.hostUserId &&
+                      (
+                        (!(request.auth.uid in resource.data.playerUserIds) &&
+                         request.resource.data.playerUserIds.size() == resource.data.playerUserIds.size() + 1 &&
+                         request.auth.uid in request.resource.data.playerUserIds) ||
+
+                        (request.auth.uid in resource.data.playerUserIds &&
+                         request.resource.data.playerUserIds.size() == resource.data.playerUserIds.size() - 1 &&
+                         !(request.auth.uid in request.resource.data.playerUserIds)) ||
+                         
+                        // ✅ SECURED: Changed hasAny to hasOnly so Ludo seating cannot overwrite room host/status
+                        (request.auth.uid in resource.data.playerUserIds &&
+                         request.resource.data.playerUserIds.size() == resource.data.playerUserIds.size() &&
+                         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['seatedPlayerUserIds', 'players'])) ||
+                        
+                        (request.auth.uid == resource.data.hostUserId &&
+                         resource.data.status == 'pending' && request.resource.data.status == 'playing') ||
+
+                        (request.auth.uid == resource.data.hostUserId &&
+                         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['password'])) ||
+
+                        (request.auth.uid == resource.data.hostUserId &&
+                         resource.data.status == 'pending' &&
+                         request.resource.data.status == 'pending' &&
+                         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['players', 'playerUserIds', 'seatedPlayerUserIds'])) ||
+
+                        (request.auth.uid == resource.data.hostUserId &&
+                         resource.data.playerUserIds.size() <= 1 &&
+                         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status']) &&
+                         request.resource.data.status == 'deleted'
+                        ) ||
+                        
+                        // ✅ SECURED: Changed hasAny to hasOnly so token moves cannot tamper with room ownership
+                        (
+                          request.auth.uid in resource.data.seatedPlayerUserIds &&
+                          resource.data.status == 'playing' &&
+                          request.resource.data.status == 'playing' &&
+                          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['tokens', 'turn', 'diceValue', 'winners', 'waitingForTokenSelection', 'movableTokenIds'])
+                        )
+                      );
+    }
+    
+    // --- THE FIXED VOICE SESSIONS RULE BLOCK ---
+    match /voiceSessions/{voiceSessionId} {
+      allow get, list: if isSignedIn();
+      allow create: if request.resource.data.hostUserId == request.auth.uid;
+      allow delete: if request.auth.uid == resource.data.hostUserId;
+      
+      allow update: if isSignedIn() && (
+        // 1. HOST: Can do anything
+        request.auth.uid == resource.data.hostUserId ||
+        
+        // 2. ADMIN: Can update room generally (including musicState), but CANNOT modify admin list or host
+        (
+          request.auth.uid in resource.data.adminUserIds &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['adminUserIds', 'hostUserId']) &&
+          // Admin cannot chat ban the host (cannot add host to chatBannedUserIds if they weren't already in it)
+          (
+            !request.resource.data.diff(resource.data).affectedKeys().hasAny(['chatBannedUserIds']) ||
+            !request.resource.data.get('chatBannedUserIds', []).hasAny([resource.data.hostUserId]) ||
+            resource.data.get('chatBannedUserIds', []).hasAny([resource.data.hostUserId])
+          )
+        ) ||
+        
+        // 3. REGULAR USER: Strict limitations on what they can touch
+        (
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'players', 
+            'playerUserIds', 
+            'visitedUserIds', 
+            'latestEmoji',
+            'selfMutedUserIds',
+            'playerCount',
+            'lastActiveTimestamp'
+          ])
+        )
+      );
+
+      match /chatMessages/{chatMessageId} {
+        allow read, list: if isSignedIn();
+        allow create: if isSignedIn();
+        allow update, delete: if false;
+      }
+      
+      match /members/{memberId} {
+        allow read: if isSignedIn();
+        allow write: if isSignedIn() && request.auth.uid == memberId;
+      }
+
+      match /contributions/{contribId} {
+        allow read: if isSignedIn();
+        allow write: if false; 
+      }
+    }
+
+    match /gameSessions/{gameSessionId} {
+      allow get, list: if isSignedIn();
+      allow create: if request.resource.data.hostUserId == request.auth.uid;
+      allow delete: if false; 
+      
+      allow update: if isSignedIn() &&
+                      request.resource.data.hostUserId == resource.data.hostUserId &&
+                      (
+                        (!(request.auth.uid in resource.data.playerUserIds) &&
+                         request.resource.data.playerUserIds.size() == resource.data.playerUserIds.size() + 1 &&
+                         request.auth.uid in request.resource.data.playerUserIds) ||
+
+                        (request.auth.uid in resource.data.playerUserIds &&
+                         request.resource.data.playerUserIds.size() == resource.data.playerUserIds.size() - 1 &&
+                         !(request.auth.uid in request.resource.data.playerUserIds)) ||
+                         
+                        (request.auth.uid in resource.data.playerUserIds &&
+                         request.resource.data.playerUserIds.size() == resource.data.playerUserIds.size() &&
+                         request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+                           'seatedPlayerUserIds', 
+                           'players', 
+                           'readyPlayers',
+                           'emptySeats',
+                           'playerUserIds'
+                         ])) ||
+                        
+                        // ✅ SECURED: Added hasOnly(['status']) so seated players changing status cannot overwrite room players/host
+                        (request.auth.uid in resource.data.seatedPlayerUserIds &&
+                         resource.data.status != request.resource.data.status &&
+                         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status'])) ||
+
+                        (request.auth.uid == resource.data.hostUserId &&
+                         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['password'])) ||
+
+                        (request.auth.uid == resource.data.hostUserId &&
+                         resource.data.status == 'pending' &&
+                         request.resource.data.status == 'pending' &&
+                         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['players', 'playerUserIds', 'seatedPlayerUserIds', 'readyPlayers'])) ||
+
+                        (request.auth.uid == resource.data.hostUserId &&
+                          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['playerUserIds']) &&
+                          request.resource.data.playerUserIds.size() == resource.data.playerUserIds.size() - 1
+                        ) ||
+
+                        (request.auth.uid == resource.data.hostUserId &&
+                         resource.data.playerUserIds.size() <= 1 &&
+                         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status']) &&
+                         request.resource.data.status == 'deleted'
+                        ) ||
+                        
+                        (
+                          request.auth.uid == resource.data.hostUserId &&
+                          resource.data.status == 'pending' &&
+                          request.resource.data.status == 'pending' &&
+                          request.resource.data.maxPlayers != resource.data.maxPlayers &&
+                          request.resource.data.maxPlayers >= resource.data.seatedPlayerUserIds.size() &&
+                          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['players', 'maxPlayers', 'readyPlayers', 'emptySeats'])
+                        ) ||
+                        
+                        (
+                          request.auth.uid in resource.data.playerUserIds &&
+                          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['latestEmoji'])
+                        )
+                      );
+
+      match /games/{gameId} {
+        allow read: if request.auth.uid in get(/databases/$(database)/documents/gameSessions/$(gameSessionId)).data.playerUserIds;
+        allow create: if request.auth.uid in get(/databases/$(database)/documents/gameSessions/$(gameSessionId)).data.seatedPlayerUserIds;
+        allow update: if request.auth.uid in resource.data.participants && (
+                        isOnlyChangingOwnMapEntry('categoryVotes', resource.data, request.resource.data, request.auth.uid) ||
+                        isOnlyChangingOwnMapEntry('votes', resource.data, request.resource.data, request.auth.uid) ||
+                        isValidOrchestration(resource.data, request.resource.data) ||
+                        request.resource.data.diff(resource.data).hasOnly(['latestGift', 'latestEmoji']) ||
+                        (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['skipTurnOf', 'skipTimestamp']) && request.resource.data.skipTurnOf == request.auth.uid)
+                      );
+      }
+        
+      match /chatMessages/{chatMessageId} {
+        allow read, list: if isSignedIn();
+        allow create: if (request.auth.uid in get(/databases/$(database)/documents/gameSessions/$(gameSessionId)).data.playerUserIds && request.resource.data.senderUserId == request.auth.uid) || request.resource.data.senderUserId == 'system';
+        allow update, delete: if false;
+      }
+      
+      match /webrtcCalls/{callId} {
+        function isPlayerInGame() {
+          return request.auth.uid in get(/databases/$(database)/documents/gameSessions/$(gameSessionId)).data.playerUserIds;
+        }
+        
+        allow get: if isPlayerInGame();
+        allow list: if isSignedIn();
+        allow create: if isPlayerInGame() && request.resource.data.from == request.auth.uid;
+        allow delete: if request.auth != null && (resource.data.from == request.auth.uid || resource.data.to == request.auth.uid);
+        allow update: if false;
+      }
+    }
+
+    match /snaps/{snapId} {
+      allow read: if isSignedIn(); 
+      allow create: if isSignedIn() && request.resource.data.userId == request.auth.uid;
+      allow delete: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow update: if isSignedIn() && (
+        resource.data.userId == request.auth.uid || 
+        (
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likes', 'likedBy', 'likedByNames', 'comments']) &&
+          math.abs(request.resource.data.get('likes', 0) - resource.data.get('likes', 0)) <= 1
+        )
+      );
+    }
+
+    match /directMessages/{dmId} {
+      function isParticipant() { return request.auth.uid in resource.data.participants; }
+      function isParticipantInPath() { return request.auth.uid in dmId.split('_'); }
+
+      allow create: if request.auth.uid in request.resource.data.participants && request.resource.data.participants.size() == 2;
+      allow update: if isParticipant();
+      allow get: if isParticipant() || isParticipantInPath();
+      
+      // ✅ SECURED: Using isParticipant() matches the client's where('participants', 'array-contains', user.uid) query!
+      allow list: if isParticipant();
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        allow read, list: if isParticipantInPath() || isParticipant();
+        allow create: if (isParticipantInPath() || isParticipant()) &&
+                       request.resource.data.senderId == request.auth.uid &&
+                       isNotBlocked(dmId.replace(request.auth.uid, '').replace('_', ''), request.auth.uid) &&
+                       isNotBlocked(request.auth.uid, dmId.replace(request.auth.uid, '').replace('_', ''));
+        allow update: if false;
+        allow delete: if isParticipantInPath() || isParticipant(); 
+      }
+    }
+
+    // 🛑 DELETED THE INSECURE WILDCARD RULE `match /{path=**}/messages/{message}` that previously exposed 1-on-1 private messages!
+
+    match /coupleGifts/{coupleId}/logs/{logId} {
+      allow read: if isSignedIn();
+      allow write: if false; 
+    }
+  }
+}
