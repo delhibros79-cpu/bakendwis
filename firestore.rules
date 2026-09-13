@@ -378,6 +378,10 @@ service cloud.firestore {
 
     // 🛑 DELETED THE INSECURE WILDCARD RULE `match /{path=**}/messages/{message}` that previously exposed 1-on-1 private messages!
 
+    match /datingRooms/{document} {
+      allow read, write: if isSignedIn();
+    }
+
     match /coupleGifts/{coupleId}/logs/{logId} {
       allow read: if isSignedIn();
       allow write: if false; 

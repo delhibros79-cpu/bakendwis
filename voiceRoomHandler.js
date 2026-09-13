@@ -124,7 +124,7 @@ async function calculateRedPacketResults(packetId, io, db, admin, roomService) {
     packet.isCalculated = true;
 
     const { amount, taps, roomId, senderName } = packet;
-    
+
     // --- FIXED: 25% (1/4th) DISTRIBUTION POOL ---
     // Only 1/4th of the Red Packet's total value is given to the players. The rest burns.
     const distributablePool = Math.floor(amount / 4);
@@ -143,7 +143,7 @@ async function calculateRedPacketResults(packetId, io, db, admin, roomService) {
     }
 
     const rewards = {};
-    
+
     // 2. The Strict Rule: If 0 taps, burn the coins.
     if (totalTaps === 0) {
         console.log(`🔥 Red Packet ${packetId} burned. 0 taps!`);
@@ -189,7 +189,7 @@ async function calculateRedPacketResults(packetId, io, db, admin, roomService) {
             });
         }
         await batch.commit();
-        
+
         // 6. Send System Chat Success Message
         const chatRef = db.collection('voiceSessions').doc(roomId).collection('chatMessages').doc();
         await chatRef.set({
@@ -207,7 +207,7 @@ async function calculateRedPacketResults(packetId, io, db, admin, roomService) {
             .map(([uid, reward]) => ({ uid, amount: reward }))
             .sort((a, b) => b.amount - a.amount)
             .slice(0, 3);
-            
+
         for (const looter of sortedLooters) {
             const userDoc = await db.collection('userProfiles').doc(looter.uid).get();
             if (userDoc.exists) {
@@ -216,20 +216,20 @@ async function calculateRedPacketResults(packetId, io, db, admin, roomService) {
                 topLooters.push({ ...looter, username: "Unknown" });
             }
         }
-    } catch(e) {
+    } catch (e) {
         console.error("Error fetching top looters for Red Packet:", e);
     }
 
     const payloadObj = { packetId, rewards, topLooters };
     io.to(roomId).emit('red_packet_results', payloadObj);
-    
+
     if (roomService) {
         try {
             const payload = new TextEncoder().encode(JSON.stringify({ type: 'RED_PACKET_RESULTS', payload: payloadObj }));
             await roomService.sendData(roomId, payload, 1, []);
         } catch (e) { console.error("LiveKit Red Packet Results Error:", e); }
     }
-    
+
     activeRedPackets.delete(packetId);
 }
 
@@ -260,7 +260,7 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
         for (const [roomId, room] of activeRoomRAM.entries()) {
             if (room.needsSync) {
                 const sessionRef = db.collection("voiceSessions").doc(roomId);
-                
+
                 // 🔥 CRITICAL FIX: Only update specific fields to prevent overwriting client-side Firestore changes
                 const updates = {};
                 if (room.players !== undefined) updates.players = room.players;
@@ -277,8 +277,8 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
             }
         }
         if (count > 0) {
-            try { await batch.commit(); console.log(`[RAM Syncer] Synced ${count} rooms to Firestore.`); } 
-            catch(e) { console.error("RAM Sync failed:", e); }
+            try { await batch.commit(); console.log(`[RAM Syncer] Synced ${count} rooms to Firestore.`); }
+            catch (e) { console.error("RAM Sync failed:", e); }
         }
     }, 15000); // 15 seconds for snappy persistence
 
@@ -305,7 +305,7 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
 
     socket.on('trigger_red_packet', async (data) => {
         const { roomId, amount, waitingTime, duration, isAppWide, userId: payloadUserId } = data;
-        
+
         // 🛑 STRICT SECURITY: Enforce authenticated socket identity for Red Packet coin deductions
         if (socket.user && socket.user.uid && payloadUserId && payloadUserId !== socket.user.uid) {
             console.error(`Blocked spoofed Red Packet trigger! Socket ${socket.user.uid} tried to trigger for ${payloadUserId}`);
@@ -327,17 +327,17 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
 
         try {
             let senderName = "Someone";
-            
+
             await db.runTransaction(async (t) => {
                 const userRef = db.collection('userProfiles').doc(userId);
                 const doc = await t.get(userRef);
-                
+
                 if (!doc.exists) throw new Error("User not found");
                 const currentCoins = doc.data().coins || 0;
                 senderName = doc.data().username || "Someone";
-                
+
                 if (currentCoins < amount) throw new Error("Insufficient coins in DB");
-                
+
                 t.update(userRef, { coins: currentCoins - amount });
 
                 const ledgerRef = userRef.collection("coinLedger").doc();
@@ -359,14 +359,14 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
                 duration,
                 startTime: Date.now(),
                 senderName,
-                taps: {}, 
+                taps: {},
                 isCalculated: false
             });
 
             // Local room emit
             const payloadObj = { packetId, amount, waitingTime, duration, senderId: userId };
             io.to(roomId).emit('start_red_packet', payloadObj);
-            
+
             if (roomService) {
                 try {
                     const payload = new TextEncoder().encode(JSON.stringify({ type: 'RED_PACKET_START', payload: payloadObj }));
@@ -397,7 +397,7 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
 
     socket.on('submit_red_packet_taps', (data) => {
         const { packetId, taps, userId: payloadUserId } = data;
-        
+
         // 🛑 STRICT SECURITY: Enforce authenticated socket identity for tap submissions
         if (socket.user && socket.user.uid && payloadUserId && payloadUserId !== socket.user.uid) {
             console.error(`Blocked spoofed Red Packet tap submission! Socket ${socket.user.uid} tried to submit for ${payloadUserId}`);
@@ -442,13 +442,13 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
             const dbPlayerUserIds = room.playerUserIds || [];
 
             const existingSeat = Object.keys(currentPlayers).find(key => currentPlayers[key]?.id === userId);
-            
+
             if (existingSeat !== undefined) {
                 if (seatIndex !== null && existingSeat !== String(seatIndex) && !currentPlayers[seatIndex]) {
-                     delete room.players[existingSeat];
-                     room.players[seatIndex] = player;
-                     actionTaken = 'SWITCH_SEAT'; oldSeat = existingSeat;
-                     room.needsSync = true;
+                    delete room.players[existingSeat];
+                    room.players[seatIndex] = player;
+                    actionTaken = 'SWITCH_SEAT'; oldSeat = existingSeat;
+                    room.needsSync = true;
                 }
             } else {
                 if (seatIndex !== null && !currentPlayers[seatIndex]) {
@@ -478,20 +478,20 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
         try {
             const room = await getRoomState(roomId, db);
             if (!room) return;
-            
+
             const isSelf = verifyVoiceSocketIdentity(userId);
             const isHost = verifyVoiceSocketIdentity(room.hostUserId);
-            
+
             let requesterId = (socket.user && socket.user.uid) || socket.userId;
             if (!requesterId) {
                 const sessionUser = socketUserMap.get(socket.id);
                 if (sessionUser) requesterId = sessionUser.userId;
             }
-            
+
             const isAdmin = room.adminUserIds && room.adminUserIds.includes(requesterId);
             const targetIsHost = userId === room.hostUserId;
             const targetIsAdmin = room.adminUserIds && room.adminUserIds.includes(userId);
-            
+
             let canLift = false;
             if (isSelf || isHost) canLift = true;
             else if (isAdmin && !targetIsHost && !targetIsAdmin) canLift = true;
@@ -507,7 +507,7 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
                     room.selfMutedUserIds = room.selfMutedUserIds.filter(id => id !== userId);
                 }
                 room.needsSync = true;
-                
+
                 io.to(roomId).emit("voice_room_update", { type: 'LEAVE_SEAT', seatIndex, userId });
             }
         } catch (err) { console.error("Voice Leave Seat failed:", err); }
@@ -531,7 +531,7 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
         try {
             const room = await getRoomState(roomId, db);
             if (!room) return;
-            
+
             if (room.playerUserIds) {
                 const wasInRoom = room.playerUserIds.includes(userId);
                 room.playerUserIds = room.playerUserIds.filter(id => id !== userId);
@@ -540,7 +540,7 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
             if (room.selfMutedUserIds) {
                 room.selfMutedUserIds = room.selfMutedUserIds.filter(id => id !== userId);
             }
-            
+
             if (room.players) {
                 const foundSeat = Object.keys(room.players).find(key => room.players[key]?.id === userId);
                 if (foundSeat !== undefined) {
@@ -549,12 +549,12 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
                     delete room.players[seatIndex];
                 }
             }
-            
+
             room.needsSync = true;
             io.to(roomId).emit("voice_room_update", { type: 'EXIT', seatIndex, userId });
-            
+
             if (roomService) {
-                try { await roomService.removeParticipant(roomId, userId); } catch(e) {}
+                try { await roomService.removeParticipant(roomId, userId); } catch (e) { }
             }
         } catch (err) { console.error("Voice Exit Room failed:", err); }
     });
@@ -566,13 +566,13 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
             if (!room) return;
 
             const isHost = verifyVoiceSocketIdentity(room.hostUserId);
-            
+
             let requesterId = (socket.user && socket.user.uid) || socket.userId;
             if (!requesterId) {
                 const sessionUser = socketUserMap.get(socket.id);
                 if (sessionUser) requesterId = sessionUser.userId;
             }
-            
+
             const isAdmin = room.adminUserIds && room.adminUserIds.includes(requesterId);
             const targetIsHost = targetUserId === room.hostUserId;
             const targetIsAdmin = room.adminUserIds && room.adminUserIds.includes(targetUserId);
@@ -595,10 +595,10 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
             if (room.selfMutedUserIds) {
                 room.selfMutedUserIds = room.selfMutedUserIds.filter(id => id !== targetUserId);
             }
-            
+
             if (!room.kickedUsers) room.kickedUsers = {};
             room.kickedUsers[targetUserId] = Date.now();
-            
+
             if (room.players) {
                 const seatStr = Object.keys(room.players).find(k => room.players[k]?.id === targetUserId);
                 if (seatStr !== undefined) {
@@ -611,8 +611,8 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
             io.to(roomId).emit("voice_room_update", { type: 'KICK', seatIndex: targetSeat, userId: targetUserId });
 
             if (roomService) {
-                try { await roomService.removeParticipant(roomId, targetUserId); } 
-                catch(e) { console.error("Failed to remove LiveKit participant during kick", e); }
+                try { await roomService.removeParticipant(roomId, targetUserId); }
+                catch (e) { console.error("Failed to remove LiveKit participant during kick", e); }
             }
         } catch (err) { console.error("Voice Kick User failed:", err); }
     });
@@ -623,7 +623,7 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
         try {
             const room = await getRoomState(roomId, db);
             if (!room) return;
-            
+
             if (room.kickedUsers && room.kickedUsers[userId]) {
                 const kickedTime = room.kickedUsers[userId];
                 const fiveMinutesInMs = 5 * 60 * 1000;
@@ -633,7 +633,7 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
                     return;
                 }
             }
-            
+
             if (room.isLocked) {
                 const isHost = room.hostUserId === userId;
                 const isAdmin = (room.adminUserIds || []).includes(userId);
@@ -662,7 +662,7 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
             db.collection("userProfiles").doc(userId).update({
                 isOnline: true,
                 lastActive: admin.firestore.FieldValue.serverTimestamp()
-            }).catch(() => {});
+            }).catch(() => { });
         }
 
         if (voicePresence) {
@@ -689,7 +689,7 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
 
             if (!room.playerUserIds) room.playerUserIds = [];
             const wasInRoom = room.playerUserIds.includes(userId);
-            
+
             if (!wasInRoom) {
                 room.playerUserIds.push(userId);
                 room.playerCount = (room.playerCount || 0) + 1;
@@ -698,11 +698,11 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
                 room.selfMutedUserIds = room.selfMutedUserIds.filter(id => id !== userId);
             }
             room.needsSync = true;
-            
+
             // ⚡ PERF FIX: Broadcast JOIN_ROOM IMMEDIATELY with single read's data.
             // Previously a second userProfile read happened here, adding ~200-500ms.
-            io.to(roomId).emit("voice_room_update", { 
-                type: 'JOIN_ROOM', 
+            io.to(roomId).emit("voice_room_update", {
+                type: 'JOIN_ROOM',
                 userId,
                 isVip: uData.isVip || false,
                 vipLevel: uData.vipLevel || 0,
@@ -721,7 +721,7 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
                     vipLevel: uData.vipLevel,
                     isVipEntry: true,
                     isSystem: true
-                }).catch(()=>{});
+                }).catch(() => { });
             }
 
             // --- RED PACKET SYNC FOR LATE JOINERS ---
@@ -759,7 +759,7 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
             const sessionRef = db.collection("voiceSessions").doc(roomId);
             const pkState = {
                 isActive: true, status: 'waiting', mode: settings.mode, rule: settings.rule,
-                durationMins: settings.duration, redScore: 0, blueScore: 0, voters: [] 
+                durationMins: settings.duration, redScore: 0, blueScore: 0, voters: []
             };
             await sessionRef.update({ pkState });
             io.to(roomId).emit("voice_room_update", { type: 'PK_INITIATE', pkState });
@@ -786,13 +786,13 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
                 const redCount = filtered.filter(v => v.team === 'red').length;
                 const blueCount = filtered.filter(v => v.team === 'blue').length;
 
-                t.update(sessionRef, { 
+                t.update(sessionRef, {
                     'pkState.voters': filtered,
                     'pkState.redScore': redCount,
                     'pkState.blueScore': blueCount
                 });
             });
-            
+
             // Get the updated redCount/blueCount to send to clients
             const dbData = await db.collection("voiceSessions").doc(roomId).get();
             const updatedRedScore = dbData.data()?.pkState?.redScore || 0;
@@ -813,7 +813,7 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
             const endTimeMillis = Date.now() + (durationMins * 60000);
             await sessionRef.update({
                 'pkState.status': 'playing', 'pkState.endTime': endTimeMillis,
-                'pkState.redScore': 0, 'pkState.blueScore': 0, 'pkState.voters': [] 
+                'pkState.redScore': 0, 'pkState.blueScore': 0, 'pkState.voters': []
             });
             io.to(roomId).emit("voice_room_update", { type: 'PK_START', endTime: endTimeMillis, redScore: 0, blueScore: 0, voters: [] });
 
@@ -867,11 +867,11 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
                 return;
             }
             const sessionRef = db.collection("voiceSessions").doc(roomId);
-            await sessionRef.update({ 
+            await sessionRef.update({
                 'pkState.status': 'waiting',
                 'pkState.redScore': 0,
                 'pkState.blueScore': 0,
-                'pkState.voters': [] 
+                'pkState.voters': []
             });
             io.to(roomId).emit("voice_room_update", { type: 'PK_RESET' });
         } catch (err) { console.error("PK Reset failed:", err); }
@@ -895,17 +895,17 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
         if (voicePresence && voicePresence.has(socket.id)) {
             const presence = voicePresence.get(socket.id);
             const { roomId, userId, joinTime } = presence;
-            
+
             const minutes = Math.floor((Date.now() - joinTime) / 60000);
             if (minutes > 0 && processTimeExp) {
                 processTimeExp(roomId, minutes, db, admin).catch(e => console.error("Disconnect EXP failed", e));
             }
-            
-            voicePresence.delete(socket.id); 
+
+            voicePresence.delete(socket.id);
 
             // Remove heartbeat entry — the disconnect timer will handle cleanup
             voiceHeartbeats.delete(userId);
-            
+
             if (voiceDisconnectTimers.has(userId)) {
                 clearTimeout(voiceDisconnectTimers.get(userId));
             }
@@ -976,4 +976,4 @@ function startHeartbeatSweep(io, db, admin, voicePresence, roomService) {
     console.log('💓 Heartbeat sweep started (every 1 minute)');
 }
 
-module.exports = { registerVoiceRoomHandlers, startHeartbeatSweep };
+module.exports = { registerVoiceRoomHandlers, startHeartbeatSweep, activeRoomRAM };

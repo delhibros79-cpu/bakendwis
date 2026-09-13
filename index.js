@@ -2049,6 +2049,15 @@ io.on("connection", (socket) => {
           const decodedToken = await admin.auth().verifyIdToken(token);
           socket.user = { uid: decodedToken.uid };
           socket.userId = decodedToken.uid;
+          const existingSocketId = onlinePlayers.get(decodedToken.uid);
+          if (existingSocketId && existingSocketId !== socket.id) {
+              io.to(existingSocketId).emit("force_logout", { message: "Logged in from another device." });
+              const oldSocket = io.sockets.sockets.get(existingSocketId);
+              if (oldSocket) {
+                  oldSocket.disconnect(true);
+              }
+          }
+
           onlinePlayers.set(decodedToken.uid, socket.id);
           db.collection("userProfiles").doc(decodedToken.uid).update({
               isOnline: true,
@@ -2062,6 +2071,15 @@ io.on("connection", (socket) => {
       if (!userId) return;
       if (socket.user && socket.user.uid && socket.user.uid !== userId) return;
       socket.userId = userId;
+      const existingSocketId = onlinePlayers.get(userId);
+      if (existingSocketId && existingSocketId !== socket.id) {
+          io.to(existingSocketId).emit("force_logout", { message: "Logged in from another device." });
+          const oldSocket = io.sockets.sockets.get(existingSocketId);
+          if (oldSocket) {
+              oldSocket.disconnect(true);
+          }
+      }
+
       onlinePlayers.set(userId, socket.id);
       db.collection("userProfiles").doc(userId).update({
           isOnline: true,
