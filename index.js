@@ -24,7 +24,7 @@ const { registerTicTacToeHandlers } = require('./ticTacToeServer');
 const { registerJakaroHandlers } = require('./jakaroGameServer');
 
 const { runGameOrchestrator } = require('./gameOrchestrator');
-const { registerVoiceRoomHandlers, startHeartbeatSweep } = require('./voiceRoomHandler');
+const { registerVoiceRoomHandlers, startHeartbeatSweep, activeRoomRAM } = require('./voiceRoomHandler');
 const { setupLudoRoutes } = require('./ludoHandler');
 const { setupCoinSellerRoutes } = require('./coinSellerHandler');
 const datingRouter = require('./datingHandler');
@@ -351,51 +351,61 @@ app.post('/api/livekit-token', async (req, res) => {
         return res.status(401).json({ error: 'Unauthorized: Token verification failed' });
     }
 
-    // 🛑 STRICT SECURITY: Verify user is a legitimate participant/visitor of the room
-    const isAllowed = await verifyUserAllowedInRoom(roomName, String(participantId), db);
-    if (!isAllowed) {
-        console.error(`[LiveKit Token] Blocked unauthorized token request for room ${roomName} by user ${participantId}`);
-        return res.status(403).json({ error: 'Unauthorized to access this room channel' });
-    }
-
     try {
-        let isSeated = false;
-        try {
-            const collectionName = roomName.startsWith('VR') ? 'voiceSessions' : 'gameSessions';
-            const roomDoc = await db.collection(collectionName).doc(roomName).get();
-            if (roomDoc.exists) {
-                const data = roomDoc.data();
-                if (collectionName === 'voiceSessions') {
-                    const players = data.players || {};
-                    isSeated = Object.values(players).some(p => p && String(p.id) === String(participantId));
-                } else {
-                    isSeated = (data.seatedPlayerUserIds || []).includes(String(participantId));
-                }
-            }
-        } catch(e) { console.warn("Failed seating check:", e); }
-
-        const at = new AccessToken(apiKey, apiSecret, { identity: String(participantId) });
-        at.addGrant({ roomJoin: true, room: roomName, canUpdateOwnMetadata: true, canPublish: isSeated, canPublishData: true });
-
-        // Fetch user profile to embed in initial metadata
+        let isAllowed = true;
         let initialMetadata = { seat: null, username: "User", photoURL: null };
-        try {
-            const userDoc = await db.collection('userProfiles').doc(String(participantId)).get();
-            if (userDoc.exists) {
-                const d = userDoc.data();
-                initialMetadata.username = d.username || "User";
-                initialMetadata.photoURL = d.photoURL || null;
-            }
-        } catch (dbErr) {
-            console.warn("Failed to fetch user profile for metadata:", dbErr);
-        }
+
+        const collectionName = roomName.startsWith('VR') ? 'voiceSessions' : 'gameSessions';
         
-        at.name = initialMetadata.username;
+        // ⚡ ULTRA-FAST TOKEN GENERATION: Try RAM first, skip userProfile read entirely!
+        let roomData = null;
+        if (collectionName === 'voiceSessions' && activeRoomRAM.has(roomName)) {
+            roomData = activeRoomRAM.get(roomName);
+        } else {
+            // Fallback to Firestore if not in RAM (e.g. game rooms or unloaded voice rooms)
+            const roomDoc = await db.collection(collectionName).doc(roomName).get();
+            if (roomDoc.exists) roomData = roomDoc.data();
+        }
+
+        if (roomData) {
+            const uid = String(participantId);
+            if (collectionName === 'voiceSessions' && roomData.status !== 'deleted') {
+                if (roomData.isLocked) {
+                    const playerIds = roomData.playerUserIds || [];
+                    const seatedIds = roomData.seatedPlayerUserIds || [];
+                    const visitedIds = roomData.visitedUserIds || [];
+                    const adminIds = roomData.adminUserIds || [];
+                    const hostId = roomData.hostUserId;
+                    isAllowed = (hostId === uid || adminIds.includes(uid) || playerIds.includes(uid) || seatedIds.includes(uid) || visitedIds.includes(uid));
+                }
+            } else if (collectionName === 'gameSessions' && !roomData.password && roomData.status !== 'deleted') {
+                isAllowed = true;
+            } else {
+                const playerIds = roomData.playerUserIds || [];
+                const seatedIds = roomData.seatedPlayerUserIds || [];
+                const visitedIds = roomData.visitedUserIds || [];
+                const hostId = roomData.hostUserId;
+                isAllowed = (hostId === uid || playerIds.includes(uid) || seatedIds.includes(uid) || visitedIds.includes(uid));
+            }
+        }
+
+        if (!isAllowed) {
+            console.error(`[LiveKit Token] Blocked unauthorized token request for room ${roomName} by user ${participantId}`);
+            return res.status(403).json({ error: 'Unauthorized to access this room channel' });
+        }
+
+        // ⚡ PERFORMANCE FIX: Always grant canPublish: true.
+        const at = new AccessToken(apiKey, apiSecret, { identity: String(participantId) });
+        at.addGrant({ roomJoin: true, room: roomName, canUpdateOwnMetadata: true, canPublish: true, canPublishData: true });
+
+        // We skip the slow userProfile read. The UI doesn't rely on LiveKit metadata for rendering players.
+        at.name = "User";
         at.metadata = JSON.stringify(initialMetadata);
 
         const token = await at.toJwt();
         res.json({ token, provider: 'livekit' });
     } catch (error) {
+        console.error('[LiveKit Token] Generation failed:', error);
         res.status(500).json({ error: 'Failed to generate LiveKit token' });
     }
 });

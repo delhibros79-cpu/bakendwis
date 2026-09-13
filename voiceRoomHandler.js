@@ -8,6 +8,116 @@ const voiceHeartbeats = new Map();
 // --- RED PACKET MEMORY ENGINE ---
 const activeRedPackets = new Map();
 
+// --- HYBRID RAM ARCHITECTURE: In-Memory Room State ---
+const activeRoomRAM = new Map();
+module.exports.activeRoomRAM = activeRoomRAM;
+
+async function getRoomState(roomId, db) {
+    if (activeRoomRAM.has(roomId)) {
+        return activeRoomRAM.get(roomId);
+    }
+    const doc = await db.collection("voiceSessions").doc(roomId).get();
+    if (!doc.exists) return null;
+    const data = doc.data();
+    data.needsSync = false;
+    activeRoomRAM.set(roomId, data);
+    return data;
+}
+
+// --- SHARED CLEANUP: Properly removes a ghost user from BOTH RAM and Firestore ---
+// This is the SINGLE source of truth for cleanup logic, used by both the
+// disconnect timer and the heartbeat sweep. Previously, cleanup only wrote to
+// Firestore, but the RAM Syncer (every 15s) would overwrite it with stale RAM
+// data — permanently resurrecting ghost players.
+async function cleanupUserFromRoom(userId, roomId, io, db, admin, voicePresence, roomService) {
+    // Pre-flight: Is the user actually back online? (reconnected before cleanup fired)
+    let isActuallyOnline = false;
+    if (voicePresence) {
+        for (const [, p] of voicePresence.entries()) {
+            if (p.userId === userId && p.roomId === roomId) {
+                isActuallyOnline = true;
+                break;
+            }
+        }
+    }
+    if (isActuallyOnline) {
+        console.log(`🧹 [Cleanup] Skipping ${userId} — reconnected to room ${roomId}`);
+        return;
+    }
+
+    let seatToClear = null;
+
+    // --- STEP 1: Clean the in-memory RAM state FIRST ---
+    // This MUST happen before the RAM Syncer's next tick (every 15s), otherwise
+    // the syncer will overwrite our Firestore cleanup with stale RAM data.
+    const ramRoom = activeRoomRAM.get(roomId);
+    if (ramRoom) {
+        if (ramRoom.playerUserIds) {
+            const wasInRoom = ramRoom.playerUserIds.includes(userId);
+            ramRoom.playerUserIds = ramRoom.playerUserIds.filter(id => id !== userId);
+            if (wasInRoom && ramRoom.playerCount > 0) {
+                ramRoom.playerCount -= 1;
+            }
+        }
+        if (ramRoom.selfMutedUserIds) {
+            ramRoom.selfMutedUserIds = ramRoom.selfMutedUserIds.filter(id => id !== userId);
+        }
+        if (ramRoom.players) {
+            const seatIndex = Object.keys(ramRoom.players).find(key => ramRoom.players[key]?.id === userId);
+            if (seatIndex !== undefined) {
+                seatToClear = parseInt(seatIndex);
+                delete ramRoom.players[seatIndex];
+            }
+        }
+        ramRoom.needsSync = true; // Syncer will now write the CLEAN state
+    }
+
+    // --- STEP 2: Also clean Firestore directly for immediate persistence ---
+    try {
+        const sessionRef = db.collection("voiceSessions").doc(roomId);
+        await db.runTransaction(async (t) => {
+            const doc = await t.get(sessionRef);
+            if (!doc.exists) return;
+
+            const docData = doc.data();
+            const dbPlayerUserIds = docData.playerUserIds || [];
+            const currentPlayers = docData.players || {};
+
+            // Skip if user is not even in Firestore
+            if (!dbPlayerUserIds.includes(userId)) return;
+
+            const updates = {
+                playerUserIds: admin.firestore.FieldValue.arrayRemove(userId),
+                selfMutedUserIds: admin.firestore.FieldValue.arrayRemove(userId),
+                playerCount: admin.firestore.FieldValue.increment(-1)
+            };
+
+            const firestoreSeat = Object.keys(currentPlayers).find(key => currentPlayers[key]?.id === userId);
+            if (firestoreSeat !== undefined) {
+                updates[`players.${firestoreSeat}`] = admin.firestore.FieldValue.delete();
+                if (seatToClear === null) seatToClear = parseInt(firestoreSeat);
+            }
+
+            t.update(sessionRef, updates);
+        });
+    } catch (err) {
+        console.error(`🧹 [Cleanup] Firestore cleanup failed for ${userId} in ${roomId}:`, err);
+    }
+
+    // --- STEP 3: Notify all remaining room members ---
+    io.to(roomId).emit("voice_room_update", { type: 'EXIT', userId, seatIndex: seatToClear });
+
+    // --- STEP 4: Remove from LiveKit voice connection ---
+    if (roomService) {
+        try {
+            await roomService.removeParticipant(roomId, userId);
+        } catch (e) { console.warn("🧹 [Cleanup] LiveKit removeParticipant:", e); }
+    }
+
+    console.log(`🧹 [Cleanup] Removed ghost user ${userId} from room ${roomId} (seat: ${seatToClear})`);
+}
+
+
 async function calculateRedPacketResults(packetId, io, db, admin, roomService) {
     const packet = activeRedPackets.get(packetId);
     if (!packet) return;
@@ -90,7 +200,27 @@ async function calculateRedPacketResults(packetId, io, db, admin, roomService) {
         });
     }
 
-    const payloadObj = { packetId, rewards };
+    // --- CALCULATE TOP 3 LOOTERS AND FETCH USERNAMES ---
+    const topLooters = [];
+    try {
+        const sortedLooters = Object.entries(rewards)
+            .map(([uid, reward]) => ({ uid, amount: reward }))
+            .sort((a, b) => b.amount - a.amount)
+            .slice(0, 3);
+            
+        for (const looter of sortedLooters) {
+            const userDoc = await db.collection('userProfiles').doc(looter.uid).get();
+            if (userDoc.exists) {
+                topLooters.push({ ...looter, username: userDoc.data().username || "Unknown" });
+            } else {
+                topLooters.push({ ...looter, username: "Unknown" });
+            }
+        }
+    } catch(e) {
+        console.error("Error fetching top looters for Red Packet:", e);
+    }
+
+    const payloadObj = { packetId, rewards, topLooters };
     io.to(roomId).emit('red_packet_results', payloadObj);
     
     if (roomService) {
@@ -119,6 +249,38 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
         }
         return false;
     }
+
+    // ==========================================
+    // HYBRID RAM ARCHITECTURE: Background Syncer
+    // ==========================================
+    setInterval(async () => {
+        const batch = db.batch();
+        let count = 0;
+        const now = admin.firestore.FieldValue.serverTimestamp();
+        for (const [roomId, room] of activeRoomRAM.entries()) {
+            if (room.needsSync) {
+                const sessionRef = db.collection("voiceSessions").doc(roomId);
+                
+                // 🔥 CRITICAL FIX: Only update specific fields to prevent overwriting client-side Firestore changes
+                const updates = {};
+                if (room.players !== undefined) updates.players = room.players;
+                if (room.playerCount !== undefined) updates.playerCount = room.playerCount;
+                if (room.playerUserIds !== undefined) updates.playerUserIds = room.playerUserIds;
+                if (room.selfMutedUserIds !== undefined) updates.selfMutedUserIds = room.selfMutedUserIds;
+                if (room.kickedUsers !== undefined) updates.kickedUsers = room.kickedUsers;
+                updates.lastActiveTimestamp = now;
+
+                batch.update(sessionRef, updates);
+                room.needsSync = false;
+                count++;
+                if (count >= 400) break; // Keep under Firestore 500 batch limit
+            }
+        }
+        if (count > 0) {
+            try { await batch.commit(); console.log(`[RAM Syncer] Synced ${count} rooms to Firestore.`); } 
+            catch(e) { console.error("RAM Sync failed:", e); }
+        }
+    }, 15000); // 15 seconds for snappy persistence
 
     // ==========================================
     // RED PACKET SOCKET LISTENERS
@@ -272,115 +434,81 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
             return;
         }
         try {
-            const sessionRef = db.collection("voiceSessions").doc(roomId);
+            const room = await getRoomState(roomId, db);
+            if (!room) return;
+
             let actionTaken = null; let oldSeat = null;
+            const currentPlayers = room.players || {};
+            const dbPlayerUserIds = room.playerUserIds || [];
 
-            await db.runTransaction(async (t) => {
-                const doc = await t.get(sessionRef);
-                if (!doc.exists) return;
-                const d = doc.data();
-                const currentPlayers = d.players || {};
-                const dbPlayerUserIds = d.playerUserIds || [];
-
-                const existingSeat = Object.keys(currentPlayers).find(key => currentPlayers[key]?.id === userId);
-                if (existingSeat !== undefined) {
-                    if (seatIndex !== null && existingSeat !== String(seatIndex) && !currentPlayers[seatIndex]) {
-                         t.update(sessionRef, {
-                             [`players.${existingSeat}`]: admin.firestore.FieldValue.delete(),
-                             [`players.${seatIndex}`]: player,
-                             lastActiveTimestamp: admin.firestore.FieldValue.serverTimestamp()
-                         });
-                         actionTaken = 'SWITCH_SEAT'; oldSeat = existingSeat;
-                    }
-                    return; 
+            const existingSeat = Object.keys(currentPlayers).find(key => currentPlayers[key]?.id === userId);
+            
+            if (existingSeat !== undefined) {
+                if (seatIndex !== null && existingSeat !== String(seatIndex) && !currentPlayers[seatIndex]) {
+                     delete room.players[existingSeat];
+                     room.players[seatIndex] = player;
+                     actionTaken = 'SWITCH_SEAT'; oldSeat = existingSeat;
+                     room.needsSync = true;
                 }
-
+            } else {
                 if (seatIndex !== null && !currentPlayers[seatIndex]) {
-                    const updates = {
-                        [`players.${seatIndex}`]: player,
-                        playerUserIds: admin.firestore.FieldValue.arrayUnion(userId),
-                        lastActiveTimestamp: admin.firestore.FieldValue.serverTimestamp()
-                    };
+                    if (!room.players) room.players = {};
+                    room.players[seatIndex] = player;
                     if (!dbPlayerUserIds.includes(userId)) {
-                        updates.playerCount = admin.firestore.FieldValue.increment(1);
+                        room.playerUserIds.push(userId);
+                        room.playerCount = (room.playerCount || 0) + 1;
                     }
-                    t.update(sessionRef, updates);
                     actionTaken = 'TAKE_SEAT';
+                    room.needsSync = true;
                 }
-            });
+            }
 
             if (actionTaken) {
-                // Re-read confirmed state after transaction for authoritative sync
-                const confirmedDoc = await sessionRef.get();
-                const confirmedPlayers = confirmedDoc.exists ? (confirmedDoc.data().players || {}) : {};
-
                 if (actionTaken === 'SWITCH_SEAT') {
                     io.to(roomId).emit("voice_room_update", { type: 'SWITCH_SEAT', oldSeat, newSeat: seatIndex, player, userId });
                 } else {
                     io.to(roomId).emit("voice_room_update", { type: 'TAKE_SEAT', seatIndex, player, userId });
                 }
-
-                if (roomService) {
-                    try {
-                        await roomService.updateParticipant(roomId, userId, undefined, { canPublish: true, canSubscribe: true, canPublishData: true });
-                    } catch(e) {}
-                }
             }
-
         } catch (err) { console.error("Voice Take Seat failed:", err); }
     });
 
     socket.on("voice_action_leave_seat", async (data) => {
         const { roomId, seatIndex, userId } = data;
         try {
-            const sessionRef = db.collection("voiceSessions").doc(roomId);
-            let success = false;
-            await db.runTransaction(async (t) => {
-                const doc = await t.get(sessionRef);
-                if (!doc.exists) return;
-                const d = doc.data();
-                
-                const isSelf = verifyVoiceSocketIdentity(userId);
-                const isHost = verifyVoiceSocketIdentity(d.hostUserId);
-                
-                let requesterId = (socket.user && socket.user.uid) || socket.userId;
-                if (!requesterId) {
-                    const sessionUser = socketUserMap.get(socket.id);
-                    if (sessionUser) requesterId = sessionUser.userId;
-                }
-                
-                const isAdmin = d.adminUserIds && d.adminUserIds.includes(requesterId);
-                const targetIsHost = userId === d.hostUserId;
-                const targetIsAdmin = d.adminUserIds && d.adminUserIds.includes(userId);
-                
-                let canLift = false;
-                if (isSelf || isHost) {
-                    canLift = true; // Self or Host
-                } else if (isAdmin && !targetIsHost && !targetIsAdmin) {
-                    canLift = true; // Admin lifting normal user
-                }
+            const room = await getRoomState(roomId, db);
+            if (!room) return;
+            
+            const isSelf = verifyVoiceSocketIdentity(userId);
+            const isHost = verifyVoiceSocketIdentity(room.hostUserId);
+            
+            let requesterId = (socket.user && socket.user.uid) || socket.userId;
+            if (!requesterId) {
+                const sessionUser = socketUserMap.get(socket.id);
+                if (sessionUser) requesterId = sessionUser.userId;
+            }
+            
+            const isAdmin = room.adminUserIds && room.adminUserIds.includes(requesterId);
+            const targetIsHost = userId === room.hostUserId;
+            const targetIsAdmin = room.adminUserIds && room.adminUserIds.includes(userId);
+            
+            let canLift = false;
+            if (isSelf || isHost) canLift = true;
+            else if (isAdmin && !targetIsHost && !targetIsAdmin) canLift = true;
 
-                if (!canLift) {
-                    console.error(`Blocked unauthorized voice_action_leave_seat attempt by ${requesterId || 'unauth'} against ${userId}`);
-                    return;
-                }
+            if (!canLift) {
+                console.error(`Blocked unauthorized voice_action_leave_seat attempt by ${requesterId || 'unauth'} against ${userId}`);
+                return;
+            }
 
-                if (seatIndex !== null && seatIndex !== undefined) {
-                    t.update(sessionRef, { 
-                        [`players.${seatIndex}`]: admin.firestore.FieldValue.delete(),
-                        selfMutedUserIds: admin.firestore.FieldValue.arrayRemove(userId)
-                    });
-                    success = true;
+            if (seatIndex !== null && seatIndex !== undefined && room.players && room.players[seatIndex]) {
+                delete room.players[seatIndex];
+                if (room.selfMutedUserIds) {
+                    room.selfMutedUserIds = room.selfMutedUserIds.filter(id => id !== userId);
                 }
-            });
-            if (success) {
-                const confirmedDoc = await sessionRef.get();
+                room.needsSync = true;
+                
                 io.to(roomId).emit("voice_room_update", { type: 'LEAVE_SEAT', seatIndex, userId });
-                if (roomService) {
-                    try {
-                        await roomService.updateParticipant(roomId, userId, undefined, { canPublish: false, canSubscribe: true, canPublishData: true });
-                    } catch(e) {}
-                }
             }
         } catch (err) { console.error("Voice Leave Seat failed:", err); }
     });
@@ -401,43 +529,32 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
         voiceHeartbeats.delete(userId);
 
         try {
-            const sessionRef = db.collection("voiceSessions").doc(roomId);
-            let success = false;
-            await db.runTransaction(async (t) => {
-                const doc = await t.get(sessionRef);
-                if (!doc.exists) return;
-                
-                const dbData = doc.data();
-                const currentPlayers = dbData.players || {};
-                const dbPlayerUserIds = dbData.playerUserIds || [];
-                const updates = { 
-                    playerUserIds: admin.firestore.FieldValue.arrayRemove(userId),
-                    selfMutedUserIds: admin.firestore.FieldValue.arrayRemove(userId),
-                    lastActiveTimestamp: admin.firestore.FieldValue.serverTimestamp()
-                };
-                if (dbPlayerUserIds.includes(userId)) {
-                    updates.playerCount = admin.firestore.FieldValue.increment(-1);
-                }
-                
-                const foundSeat = Object.keys(currentPlayers).find(key => currentPlayers[key]?.id === userId);
-                if (foundSeat !== undefined) {
-                    updates[`players.${foundSeat}`] = admin.firestore.FieldValue.delete();
-                } else if (seatIndex !== null && seatIndex !== undefined) {
-                    updates[`players.${seatIndex}`] = admin.firestore.FieldValue.delete();
-                }
-                
-                t.update(sessionRef, updates);
-                success = true;
-            });
+            const room = await getRoomState(roomId, db);
+            if (!room) return;
             
-            if (success) {
-                const confirmedDoc = await sessionRef.get();
-                io.to(roomId).emit("voice_room_update", { type: 'EXIT', seatIndex, userId });
-                if (roomService) {
-                    try {
-                        await roomService.removeParticipant(roomId, userId);
-                    } catch(e) {}
+            if (room.playerUserIds) {
+                const wasInRoom = room.playerUserIds.includes(userId);
+                room.playerUserIds = room.playerUserIds.filter(id => id !== userId);
+                if (wasInRoom && room.playerCount > 0) room.playerCount -= 1;
+            }
+            if (room.selfMutedUserIds) {
+                room.selfMutedUserIds = room.selfMutedUserIds.filter(id => id !== userId);
+            }
+            
+            if (room.players) {
+                const foundSeat = Object.keys(room.players).find(key => room.players[key]?.id === userId);
+                if (foundSeat !== undefined) {
+                    delete room.players[foundSeat];
+                } else if (seatIndex !== null && seatIndex !== undefined) {
+                    delete room.players[seatIndex];
                 }
+            }
+            
+            room.needsSync = true;
+            io.to(roomId).emit("voice_room_update", { type: 'EXIT', seatIndex, userId });
+            
+            if (roomService) {
+                try { await roomService.removeParticipant(roomId, userId); } catch(e) {}
             }
         } catch (err) { console.error("Voice Exit Room failed:", err); }
     });
@@ -445,71 +562,57 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
     socket.on("voice_action_kick_user", async (data) => {
         const { roomId, userId: targetUserId } = data;
         try {
-            const sessionRef = db.collection("voiceSessions").doc(roomId);
-            let success = false;
+            const room = await getRoomState(roomId, db);
+            if (!room) return;
+
+            const isHost = verifyVoiceSocketIdentity(room.hostUserId);
+            
+            let requesterId = (socket.user && socket.user.uid) || socket.userId;
+            if (!requesterId) {
+                const sessionUser = socketUserMap.get(socket.id);
+                if (sessionUser) requesterId = sessionUser.userId;
+            }
+            
+            const isAdmin = room.adminUserIds && room.adminUserIds.includes(requesterId);
+            const targetIsHost = targetUserId === room.hostUserId;
+            const targetIsAdmin = room.adminUserIds && room.adminUserIds.includes(targetUserId);
+
+            let canKick = false;
+            if (isHost) canKick = true;
+            else if (isAdmin && !targetIsHost && !targetIsAdmin) canKick = true;
+
+            if (!canKick) {
+                console.error(`Blocked unauthorized kick attempt by ${requesterId || 'unauth'} against ${targetUserId}`);
+                return;
+            }
+
             let targetSeat = null;
-            await db.runTransaction(async (t) => {
-                const doc = await t.get(sessionRef);
-                if (!doc.exists) return;
-                const d = doc.data();
-
-                const isHost = verifyVoiceSocketIdentity(d.hostUserId);
-                
-                let requesterId = (socket.user && socket.user.uid) || socket.userId;
-                if (!requesterId) {
-                    const sessionUser = socketUserMap.get(socket.id);
-                    if (sessionUser) requesterId = sessionUser.userId;
+            if (room.playerUserIds) {
+                const wasInRoom = room.playerUserIds.includes(targetUserId);
+                room.playerUserIds = room.playerUserIds.filter(id => id !== targetUserId);
+                if (wasInRoom && room.playerCount > 0) room.playerCount -= 1;
+            }
+            if (room.selfMutedUserIds) {
+                room.selfMutedUserIds = room.selfMutedUserIds.filter(id => id !== targetUserId);
+            }
+            
+            if (!room.kickedUsers) room.kickedUsers = {};
+            room.kickedUsers[targetUserId] = Date.now();
+            
+            if (room.players) {
+                const seatStr = Object.keys(room.players).find(k => room.players[k]?.id === targetUserId);
+                if (seatStr !== undefined) {
+                    targetSeat = parseInt(seatStr);
+                    delete room.players[seatStr];
                 }
-                
-                const isAdmin = d.adminUserIds && d.adminUserIds.includes(requesterId);
-                const targetIsHost = targetUserId === d.hostUserId;
-                const targetIsAdmin = d.adminUserIds && d.adminUserIds.includes(targetUserId);
+            }
 
-                let canKick = false;
-                if (isHost) {
-                    canKick = true;
-                } else if (isAdmin && !targetIsHost && !targetIsAdmin) {
-                    canKick = true;
-                }
+            room.needsSync = true;
+            io.to(roomId).emit("voice_room_update", { type: 'KICK', seatIndex: targetSeat, userId: targetUserId });
 
-                if (!canKick) {
-                    console.error(`Blocked unauthorized kick attempt by ${requesterId || 'unauth'} against ${targetUserId}`);
-                    return;
-                }
-
-                const currentPlayers = d.players || {};
-                const dbPlayerUserIds = d.playerUserIds || [];
-                const seatIndexStr = Object.keys(currentPlayers).find(key => currentPlayers[key]?.id === targetUserId);
-                
-                const updates = { 
-                    playerUserIds: admin.firestore.FieldValue.arrayRemove(targetUserId),
-                    selfMutedUserIds: admin.firestore.FieldValue.arrayRemove(targetUserId),
-                    lastActiveTimestamp: admin.firestore.FieldValue.serverTimestamp(),
-                    [`kickedUsers.${targetUserId}`]: Date.now()
-                };
-                if (dbPlayerUserIds.includes(targetUserId)) {
-                    updates.playerCount = admin.firestore.FieldValue.increment(-1);
-                }
-                
-                if (seatIndexStr !== undefined) {
-                    targetSeat = parseInt(seatIndexStr);
-                    updates[`players.${seatIndexStr}`] = admin.firestore.FieldValue.delete();
-                }
-
-                t.update(sessionRef, updates);
-                success = true;
-            });
-
-            if (success) {
-                const confirmedDoc = await sessionRef.get();
-                io.to(roomId).emit("voice_room_update", { type: 'KICK', seatIndex: targetSeat, userId: targetUserId });
-                if (roomService) {
-                    try {
-                        await roomService.removeParticipant(roomId, targetUserId);
-                    } catch(e) {
-                        console.error("Failed to remove LiveKit participant during kick", e);
-                    }
-                }
+            if (roomService) {
+                try { await roomService.removeParticipant(roomId, targetUserId); } 
+                catch(e) { console.error("Failed to remove LiveKit participant during kick", e); }
             }
         } catch (err) { console.error("Voice Kick User failed:", err); }
     });
@@ -518,13 +621,11 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
         const { roomId, userId, password, isInvite, isReconnect } = data;
 
         try {
-            const sessionRef = db.collection("voiceSessions").doc(roomId);
-            const sessionDoc = await sessionRef.get();
-            if (!sessionDoc.exists) return;
-            const sessionData = sessionDoc.data();
+            const room = await getRoomState(roomId, db);
+            if (!room) return;
             
-            if (sessionData.kickedUsers && sessionData.kickedUsers[userId]) {
-                const kickedTime = sessionData.kickedUsers[userId];
+            if (room.kickedUsers && room.kickedUsers[userId]) {
+                const kickedTime = room.kickedUsers[userId];
                 const fiveMinutesInMs = 5 * 60 * 1000;
                 if (Date.now() - kickedTime < fiveMinutesInMs) {
                     const remainingMinutes = Math.ceil((fiveMinutesInMs - (Date.now() - kickedTime)) / 60000);
@@ -533,15 +634,22 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
                 }
             }
             
-            if (sessionData.isLocked) {
-                const isHost = sessionData.hostUserId === userId;
-                const isAdmin = (sessionData.adminUserIds || []).includes(userId);
-                const isAlreadyInRoom = (sessionData.playerUserIds || []).includes(userId);
-                if (!isHost && !isAdmin && !isAlreadyInRoom && !isInvite && sessionData.password !== password) {
+            if (room.isLocked) {
+                const isHost = room.hostUserId === userId;
+                const isAdmin = (room.adminUserIds || []).includes(userId);
+                const isAlreadyInRoom = (room.playerUserIds || []).includes(userId);
+                if (!isHost && !isAdmin && !isAlreadyInRoom && !isInvite && room.password !== password) {
                     socket.emit('voice_room_update', { type: 'ERROR', message: 'Invalid password' });
                     return; // Reject connection
                 }
             }
+            // 🔥 INSTANT UI UNBLOCK: Emit FULL_SYNC immediately!
+            socket.emit("voice_room_update", {
+                type: 'FULL_SYNC',
+                roomId: roomId,
+                room: { id: roomId, ...room }
+            });
+
         } catch (e) {
             console.error("Error checking room lock:", e);
             return;
@@ -570,55 +678,29 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
         }
 
         try {
-            const sessionRef = db.collection("voiceSessions").doc(roomId);
-            const userRef = db.collection("userProfiles").doc(userId);
+            // ⚡ PERF FIX: Fetch room state and user profile in PARALLEL (saves ~300-500ms).
+            // Previously these were two separate sequential reads of the SAME userProfile doc.
+            const [room, userDoc] = await Promise.all([
+                getRoomState(roomId, db),
+                db.collection("userProfiles").doc(userId).get()
+            ]);
+            if (!room) return;
+            const uData = userDoc.exists ? userDoc.data() : {};
+
+            if (!room.playerUserIds) room.playerUserIds = [];
+            const wasInRoom = room.playerUserIds.includes(userId);
             
-            const userDoc = await userRef.get();
+            if (!wasInRoom) {
+                room.playerUserIds.push(userId);
+                room.playerCount = (room.playerCount || 0) + 1;
+            }
+            if (room.selfMutedUserIds) {
+                room.selfMutedUserIds = room.selfMutedUserIds.filter(id => id !== userId);
+            }
+            room.needsSync = true;
             
-            await db.runTransaction(async (t) => {
-                const currentPresence = voicePresence?.get(socket.id);
-                if (!currentPresence || currentPresence.roomId !== roomId) {
-                    return; 
-                }
-
-                const sessionDoc = await t.get(sessionRef);
-                if (!sessionDoc.exists) return;
-
-                const sessionData = sessionDoc.data();
-                const dbPlayerUserIds = sessionData.playerUserIds || [];
-
-                const finalUpdates = {
-                    playerUserIds: admin.firestore.FieldValue.arrayUnion(userId),
-                    lastActiveTimestamp: admin.firestore.FieldValue.serverTimestamp(),
-                    selfMutedUserIds: admin.firestore.FieldValue.arrayRemove(userId)
-                };
-                if (!dbPlayerUserIds.includes(userId)) {
-                    finalUpdates.playerCount = admin.firestore.FieldValue.increment(1);
-                }
-
-                t.update(sessionRef, finalUpdates);
-                
-                if (userDoc.exists && !isReconnect) {
-                    const userData = userDoc.data();
-                    
-                    if (userData.isVip && userData.vipLevel >= 1) {
-                        const chatRef = sessionRef.collection("chatMessages").doc();
-                        t.set(chatRef, {
-                            gameSessionId: roomId,
-                            senderUserId: 'system',
-                            messageText: `[VIP ${userData.vipLevel}] ${userData.username} made a grand entrance!`,
-                            sentAt: admin.firestore.FieldValue.serverTimestamp(),
-                            vipLevel: userData.vipLevel,
-                            isVipEntry: true,
-                            isSystem: true
-                        });
-                    }
-                }
-            });
-            
-            // Broadcast JOIN_ROOM with VIP data to trigger instant entrance effect
-            const userSnap = await db.collection("userProfiles").doc(userId).get();
-            const uData = userSnap.exists ? userSnap.data() : {};
+            // ⚡ PERF FIX: Broadcast JOIN_ROOM IMMEDIATELY with single read's data.
+            // Previously a second userProfile read happened here, adding ~200-500ms.
             io.to(roomId).emit("voice_room_update", { 
                 type: 'JOIN_ROOM', 
                 userId,
@@ -626,6 +708,21 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
                 vipLevel: uData.vipLevel || 0,
                 username: uData.username || "User"
             });
+
+            // ⚡ PERF FIX: VIP entrance chat message — fire and forget, don't block join flow
+            if (userDoc.exists && !isReconnect && uData.isVip && uData.vipLevel >= 1) {
+                const sessionRef = db.collection("voiceSessions").doc(roomId);
+                const chatRef = sessionRef.collection("chatMessages").doc();
+                chatRef.set({
+                    gameSessionId: roomId,
+                    senderUserId: 'system',
+                    messageText: `[VIP ${uData.vipLevel}] ${uData.username} made a grand entrance!`,
+                    sentAt: admin.firestore.FieldValue.serverTimestamp(),
+                    vipLevel: uData.vipLevel,
+                    isVipEntry: true,
+                    isSystem: true
+                }).catch(()=>{});
+            }
 
             // --- RED PACKET SYNC FOR LATE JOINERS ---
             for (const [packetId, packet] of activeRedPackets.entries()) {
@@ -815,59 +912,9 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
 
             const timerId = setTimeout(async () => {
                 voiceDisconnectTimers.delete(userId);
-
-                try {
-                    let seatToClear = null; 
-
-                    const sessionRef = db.collection("voiceSessions").doc(roomId);
-                    await db.runTransaction(async (t) => {
-                        const doc = await t.get(sessionRef);
-                        if (!doc.exists) return;
-                        
-                        let isActuallyOnline = false;
-                        for (let [sId, p] of voicePresence.entries()) {
-                            if (p.userId === userId && p.roomId === roomId) {
-                                isActuallyOnline = true; break;
-                            }
-                        }
-                        if (isActuallyOnline) return; 
-                        
-                        const docData = doc.data();
-                        const currentPlayers = docData.players || {};
-                        const dbPlayerUserIds = docData.playerUserIds || [];
-                        const updates = { 
-                            playerUserIds: admin.firestore.FieldValue.arrayRemove(userId),
-                            selfMutedUserIds: admin.firestore.FieldValue.arrayRemove(userId)
-                        };
-                        // FIX: Decrement playerCount when removing from playerUserIds.
-                        // Previously this was missing, causing playerCount to drift higher
-                        // over time since disconnects removed from the array but never
-                        // decremented the counter.
-                        if (dbPlayerUserIds.includes(userId)) {
-                            updates.playerCount = admin.firestore.FieldValue.increment(-1);
-                        }
-                        
-                        const seatIndex = Object.keys(currentPlayers).find(key => currentPlayers[key]?.id === userId);
-                        if (seatIndex !== undefined) {
-                            updates[`players.${seatIndex}`] = admin.firestore.FieldValue.delete();
-                            seatToClear = parseInt(seatIndex); 
-                        }
-                        
-                        t.update(sessionRef, updates);
-                    });
-                    
-                    io.to(roomId).emit("voice_room_update", { type: 'EXIT', userId, seatIndex: seatToClear });
-
-                    // Kill their LiveKit voice connection on disconnect cleanup
-                    if (roomService) {
-                        try {
-                            await roomService.removeParticipant(roomId, userId);
-                        } catch(e) { console.warn("LiveKit removeParticipant on disconnect cleanup:", e); }
-                    }
-                    
-                } catch (err) { console.error("Voice 5-minute disconnect cleanup failed:", err); }
-                
-            }, 5 * 60 * 1000);
+                console.log(`⏱️ [Disconnect Timer] 1-minute timer fired for user ${userId} in room ${roomId}`);
+                await cleanupUserFromRoom(userId, roomId, io, db, admin, voicePresence, roomService);
+            }, 1 * 60 * 1000); // 1 minute grace period
 
             voiceDisconnectTimers.set(userId, timerId);
         }
@@ -883,8 +930,8 @@ function startHeartbeatSweep(io, db, admin, voicePresence, roomService) {
     if (sweepStarted) return; // Prevent duplicate intervals
     sweepStarted = true;
 
-    const SWEEP_INTERVAL_MS = 2 * 60 * 1000;  // Run every 2 minutes
-    const DEAD_THRESHOLD_MS = 2 * 60 * 1000;  // User is dead if no heartbeat for 2 minutes
+    const SWEEP_INTERVAL_MS = 1 * 60 * 1000;  // Run every 1 minute
+    const DEAD_THRESHOLD_MS = 1 * 60 * 1000;  // User is dead if no heartbeat for 1 minute
 
     setInterval(async () => {
         const now = Date.now();
@@ -918,62 +965,7 @@ function startHeartbeatSweep(io, db, admin, voicePresence, roomService) {
             if (voiceDisconnectTimers.has(userId)) continue;
 
             console.log(`💓 Heartbeat sweep: Cleaning up ghost user ${userId} from room ${roomId}`);
-
-            try {
-                let seatToClear = null;
-                const sessionRef = db.collection("voiceSessions").doc(roomId);
-
-                await db.runTransaction(async (t) => {
-                    const doc = await t.get(sessionRef);
-                    if (!doc.exists) return;
-
-                    // Final safety check inside transaction
-                    let stillOnline = false;
-                    if (voicePresence) {
-                        for (const [, p] of voicePresence.entries()) {
-                            if (p.userId === userId && p.roomId === roomId) {
-                                stillOnline = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (stillOnline) return;
-
-                    const docData = doc.data();
-                    const currentPlayers = docData.players || {};
-                    const dbPlayerUserIds = docData.playerUserIds || [];
-
-                    // Don't clean up if user is not even in this room's data
-                    if (!dbPlayerUserIds.includes(userId)) return;
-
-                    const updates = {
-                        playerUserIds: admin.firestore.FieldValue.arrayRemove(userId),
-                        selfMutedUserIds: admin.firestore.FieldValue.arrayRemove(userId)
-                    };
-                    if (dbPlayerUserIds.includes(userId)) {
-                        updates.playerCount = admin.firestore.FieldValue.increment(-1);
-                    }
-
-                    const seatIndex = Object.keys(currentPlayers).find(key => currentPlayers[key]?.id === userId);
-                    if (seatIndex !== undefined) {
-                        updates[`players.${seatIndex}`] = admin.firestore.FieldValue.delete();
-                        seatToClear = parseInt(seatIndex);
-                    }
-
-                    t.update(sessionRef, updates);
-                });
-
-                io.to(roomId).emit("voice_room_update", { type: 'EXIT', userId, seatIndex: seatToClear });
-
-                if (roomService) {
-                    try {
-                        await roomService.removeParticipant(roomId, userId);
-                    } catch (e) { console.warn("LiveKit removeParticipant on heartbeat sweep:", e); }
-                }
-
-            } catch (err) {
-                console.error(`💓 Heartbeat sweep cleanup failed for ${userId}:`, err);
-            }
+            await cleanupUserFromRoom(userId, roomId, io, db, admin, voicePresence, roomService);
         }
 
         if (deadUsers.length > 0) {
@@ -981,7 +973,7 @@ function startHeartbeatSweep(io, db, admin, voicePresence, roomService) {
         }
     }, SWEEP_INTERVAL_MS);
 
-    console.log('💓 Heartbeat sweep started (every 2 minutes)');
+    console.log('💓 Heartbeat sweep started (every 1 minute)');
 }
 
 module.exports = { registerVoiceRoomHandlers, startHeartbeatSweep };
