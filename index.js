@@ -269,6 +269,56 @@ app.post('/api/subadmin/verify-dating', async (req, res) => {
     }
 });
 app.use('/api/dating', datingRouter);
+
+// --- SECURE DELETE ACCOUNT API ---
+app.post('/api/delete-account', async (req, res) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({ error: 'Unauthorized: Missing or invalid token' });
+    }
+
+    let uid;
+    try {
+        const decoded = await admin.auth().verifyIdToken(authHeader.split(' ')[1]);
+        uid = decoded.uid;
+    } catch (e) {
+        return res.status(401).json({ error: 'Unauthorized: Token verification failed' });
+    }
+
+    try {
+        // 1. Soft Delete & Anonymize User Profile
+        await db.collection('userProfiles').doc(uid).update({
+            username: 'Deleted User',
+            photoURL: '',
+            isDeleted: true,
+            mobileNumber: admin.firestore.FieldValue.delete(),
+            gmailId: admin.firestore.FieldValue.delete(),
+            deviceId: admin.firestore.FieldValue.delete(),
+            lastKnownIp: admin.firestore.FieldValue.delete()
+        });
+
+        // 2. Anonymize Embedded Snaps
+        const snapsSnapshot = await db.collection('snaps').where('userId', '==', uid).get();
+        if (!snapsSnapshot.empty) {
+            const batch = db.batch();
+            snapsSnapshot.docs.forEach((doc) => {
+                batch.update(doc.ref, {
+                    userName: 'Deleted User',
+                    userAvatar: ''
+                });
+            });
+            await batch.commit();
+        }
+        
+        // 3. Delete Firebase Auth user (Locks them out forever)
+        await admin.auth().deleteUser(uid);
+        
+        res.json({ success: true, message: 'Account softly deleted and anonymized successfully' });
+    } catch (error) {
+        console.error('[Delete Account API] Error:', error.message);
+        res.status(500).json({ error: 'Failed to delete account' });
+    }
+});
 const server = http.createServer(app);
 
 const io = new Server(server, {
