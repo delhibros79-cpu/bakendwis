@@ -475,6 +475,57 @@ function startCronJobs(db) {
         }
     });
 
+    // Runs every day at 03:00 - Delete direct messages older than 30 days
+    cron.schedule('0 3 * * *', async () => {
+        console.log('⏳ Running cleanup of old direct messages...');
+        try {
+            const thirtyDaysAgo = new Date();
+            thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+            const timestampThreshold = admin.firestore.Timestamp.fromDate(thirtyDaysAgo);
+
+            const oldMessagesSnap = await db.collectionGroup('messages')
+                .where('sentAt', '<', timestampThreshold)
+                .get();
+
+            if (oldMessagesSnap.empty) {
+                console.log('✅ No messages older than 30 days found.');
+                return;
+            }
+
+            let batches = [];
+            let currentBatch = db.batch();
+            let opCount = 0;
+            let totalDeleted = 0;
+
+            oldMessagesSnap.docs.forEach((doc) => {
+                if (doc.ref.path.includes('directMessages/')) {
+                    currentBatch.delete(doc.ref);
+                    opCount++;
+                    totalDeleted++;
+
+                    if (opCount === 450) {
+                        batches.push(currentBatch.commit());
+                        currentBatch = db.batch();
+                        opCount = 0;
+                    }
+                }
+            });
+
+            if (opCount > 0) {
+                batches.push(currentBatch.commit());
+            }
+
+            await Promise.all(batches);
+            console.log(`✅ Successfully deleted ${totalDeleted} messages older than 30 days.`);
+
+        } catch (error) {
+            console.error('❌ Error deleting old messages:', error);
+        }
+    }, {
+        scheduled: true,
+        timezone: "Asia/Kolkata"
+    });
+
     // ==========================================
     // FAMILY: Weekly Activeness Reset — Monday 00:00 IST (Sunday 18:30 UTC)
     // ==========================================

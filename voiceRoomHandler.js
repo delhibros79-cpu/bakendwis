@@ -24,6 +24,79 @@ async function getRoomState(roomId, db) {
     return data;
 }
 
+// --- GHOST PURGER — Validates a room's player list against live connections ---
+// A user is ONLY considered alive if they have BOTH:
+//   1. An active socket connection in voicePresence, AND
+//   2. A recent heartbeat (within the last 2 minutes)
+// Having just a socket is NOT enough — zombie sockets (app killed, network drop)
+// stay in voicePresence until Socket.IO's pingTimeout detects the dead connection,
+// which can take 45+ seconds on mobile. Heartbeats prove the CLIENT is actually alive.
+function purgeGhostsFromRAM(roomId, voicePresence) {
+    const room = activeRoomRAM.get(roomId);
+    if (!room || !room.playerUserIds || room.playerUserIds.length === 0) return 0;
+
+    const HEARTBEAT_DEAD_MS = 2 * 60 * 1000; // 2 minutes — must have heartbeat within this window
+    const now = Date.now();
+    let purgedCount = 0;
+
+    // Build set of users who have a LIVE socket connection to this room
+    const liveSocketUserIds = new Set();
+    if (voicePresence) {
+        for (const [, p] of voicePresence.entries()) {
+            if (p.roomId === roomId && p.userId) {
+                liveSocketUserIds.add(p.userId);
+            }
+        }
+    }
+
+    // Check each player in the room
+    const ghostUserIds = [];
+    for (const userId of room.playerUserIds) {
+        const hasSocket = liveSocketUserIds.has(userId);
+        const hb = voiceHeartbeats.get(userId);
+        const hasRecentHeartbeat = hb && hb.roomId === roomId && (now - hb.lastBeat) < HEARTBEAT_DEAD_MS;
+
+        // A user with a disconnect timer is in the grace period — don't purge yet
+        if (voiceDisconnectTimers.has(userId)) continue;
+
+        // SAFETY: If user has a live socket but NO heartbeat entry at all,
+        // they are a brand-new joiner (heartbeat hasn't been set yet). Skip them.
+        if (hasSocket && !hb) continue;
+
+        // Has a recent heartbeat? They're alive.
+        if (hasRecentHeartbeat) continue;
+
+        // Has a live socket with a recent heartbeat? Alive.
+        if (hasSocket && hb && (now - hb.lastBeat) < HEARTBEAT_DEAD_MS) continue;
+
+        // No recent heartbeat AND (no socket OR zombie socket) — this is a ghost
+        ghostUserIds.push(userId);
+    }
+
+    // Purge all ghosts from RAM
+    for (const ghostId of ghostUserIds) {
+        room.playerUserIds = room.playerUserIds.filter(id => id !== ghostId);
+        if (room.playerCount > 0) room.playerCount -= 1;
+        if (room.selfMutedUserIds) {
+            room.selfMutedUserIds = room.selfMutedUserIds.filter(id => id !== ghostId);
+        }
+        if (room.players) {
+            const seatKey = Object.keys(room.players).find(k => room.players[k]?.id === ghostId);
+            if (seatKey !== undefined) delete room.players[seatKey];
+        }
+        // Clean up heartbeat entry if it exists
+        voiceHeartbeats.delete(ghostId);
+        purgedCount++;
+    }
+
+    if (purgedCount > 0) {
+        room.needsSync = true;
+        console.log(`🧹 [Ghost Purge] Removed ${purgedCount} ghost(s) from room ${roomId}: [${ghostUserIds.join(', ')}]`);
+    }
+
+    return purgedCount;
+}
+
 // --- SHARED CLEANUP: Properly removes a ghost user from BOTH RAM and Firestore ---
 // This is the SINGLE source of truth for cleanup logic, used by both the
 // disconnect timer and the heartbeat sweep. Previously, cleanup only wrote to
@@ -31,6 +104,7 @@ async function getRoomState(roomId, db) {
 // data — permanently resurrecting ghost players.
 async function cleanupUserFromRoom(userId, roomId, io, db, admin, voicePresence, roomService) {
     // Pre-flight: Is the user actually back online? (reconnected before cleanup fired)
+    // Check BOTH voicePresence (socket connection) AND voiceHeartbeats (client proof-of-life)
     let isActuallyOnline = false;
     if (voicePresence) {
         for (const [, p] of voicePresence.entries()) {
@@ -38,6 +112,14 @@ async function cleanupUserFromRoom(userId, roomId, io, db, admin, voicePresence,
                 isActuallyOnline = true;
                 break;
             }
+        }
+    }
+    // Also check heartbeats — user may have reconnected and sent a heartbeat
+    // but voicePresence might not match yet (race condition during reconnection)
+    if (!isActuallyOnline) {
+        const hb = voiceHeartbeats.get(userId);
+        if (hb && hb.roomId === roomId && (Date.now() - hb.lastBeat) < 60000) {
+            isActuallyOnline = true;
         }
     }
     if (isActuallyOnline) {
@@ -258,6 +340,11 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
         let count = 0;
         const now = admin.firestore.FieldValue.serverTimestamp();
         for (const [roomId, room] of activeRoomRAM.entries()) {
+            // --- FIX 2: Reconcile ghosts BEFORE syncing to Firestore ---
+            // This prevents the RAM Syncer from resurrecting ghost players
+            // that were cleaned from Firestore (manually or by other processes).
+            purgeGhostsFromRAM(roomId, voicePresence);
+
             if (room.needsSync) {
                 const sessionRef = db.collection("voiceSessions").doc(roomId);
 
@@ -643,6 +730,11 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
                     return; // Reject connection
                 }
             }
+
+            // --- FIX 1: Purge ghost players from RAM BEFORE sending FULL_SYNC ---
+            // This ensures new joiners never see stale ghost players.
+            purgeGhostsFromRAM(roomId, voicePresence);
+
             // 🔥 INSTANT UI UNBLOCK: Emit FULL_SYNC immediately!
             socket.emit("voice_room_update", {
                 type: 'FULL_SYNC',
@@ -921,10 +1013,15 @@ function registerVoiceRoomHandlers(io, socket, db, admin, voicePresence, process
     });
 }
 
-// --- HEARTBEAT SWEEP: Runs every 2 minutes to find and remove ghost players ---
+// --- HEARTBEAT SWEEP: Runs every 1 minute to find and remove ghost players ---
 // Called ONCE from index.js at server startup. Shares the same cleanup logic as
 // the disconnect handler but catches cases where disconnect never fires
 // (app killed, network drop, server restart).
+//
+// CRITICAL BUG FIX: Previously, if a user had a zombie socket (app killed but
+// Socket.IO hadn't detected the disconnect yet), the sweep would REFRESH their
+// heartbeat — keeping the ghost alive forever. Now it force-disconnects zombie
+// sockets, which triggers the normal disconnect→cleanup flow.
 let sweepStarted = false;
 function startHeartbeatSweep(io, db, admin, voicePresence, roomService) {
     if (sweepStarted) return; // Prevent duplicate intervals
@@ -933,31 +1030,89 @@ function startHeartbeatSweep(io, db, admin, voicePresence, roomService) {
     const SWEEP_INTERVAL_MS = 1 * 60 * 1000;  // Run every 1 minute
     const DEAD_THRESHOLD_MS = 1 * 60 * 1000;  // User is dead if no heartbeat for 1 minute
 
+    // --- SERVER STARTUP CLEANUP ---
+    // On server restart, voicePresence and voiceHeartbeats are empty but Firestore
+    // still has stale playerUserIds from the previous session. Nobody can possibly
+    // be connected right after a restart, so clean ALL active rooms.
+    (async () => {
+        try {
+            console.log('🧹 [Startup] Cleaning stale voice sessions from previous server run...');
+            const snapshot = await db.collection('voiceSessions')
+                .where('playerCount', '>', 0)
+                .get();
+            
+            if (snapshot.empty) {
+                console.log('🧹 [Startup] No stale sessions found.');
+                return;
+            }
+
+            const batch = db.batch();
+            let cleanedCount = 0;
+            snapshot.forEach(doc => {
+                batch.update(doc.ref, {
+                    playerUserIds: [],
+                    players: {},
+                    playerCount: 0,
+                    selfMutedUserIds: []
+                });
+                cleanedCount++;
+            });
+
+            if (cleanedCount > 0) {
+                await batch.commit();
+                console.log(`🧹 [Startup] Cleaned ${cleanedCount} stale voice session(s) from Firestore.`);
+            }
+        } catch (e) {
+            console.error('🧹 [Startup] Failed to clean stale sessions:', e);
+        }
+    })();
+
     setInterval(async () => {
         const now = Date.now();
         const deadUsers = [];
+        const zombieSockets = []; // Sockets that are "connected" but client is dead
 
+        // --- PHASE 1: Check voiceHeartbeats for dead/zombie users ---
         for (const [userId, data] of voiceHeartbeats.entries()) {
             if (now - data.lastBeat > DEAD_THRESHOLD_MS) {
-                // Double-check: is this user still connected via any socket?
-                let isActuallyOnline = false;
+                // Find if this user has any socket in voicePresence
+                let zombieSocketId = null;
                 if (voicePresence) {
-                    for (const [, p] of voicePresence.entries()) {
+                    for (const [socketId, p] of voicePresence.entries()) {
                         if (p.userId === userId && p.roomId === data.roomId) {
-                            isActuallyOnline = true;
+                            zombieSocketId = socketId;
                             break;
                         }
                     }
                 }
-                if (!isActuallyOnline) {
+
+                if (!zombieSocketId) {
+                    // No socket at all — definitely dead
                     deadUsers.push({ userId, roomId: data.roomId });
                 } else {
-                    // They have an active socket but missed heartbeats — refresh their beat
-                    data.lastBeat = now;
+                    // HAS a socket but NO heartbeat for 1+ minute = ZOMBIE SOCKET
+                    // OLD BUG: We used to refresh their heartbeat here, keeping ghosts alive forever!
+                    // FIX: Force-disconnect the zombie socket. This triggers the normal
+                    // disconnect handler → 1-minute grace period → cleanupUserFromRoom.
+                    zombieSockets.push({ socketId: zombieSocketId, userId, roomId: data.roomId });
                 }
             }
         }
 
+        // --- PHASE 2: Force-disconnect zombie sockets ---
+        for (const { socketId, userId, roomId } of zombieSockets) {
+            console.log(`💀 [Zombie] Force-disconnecting zombie socket ${socketId} for user ${userId} in room ${roomId}`);
+            try {
+                const zombieSocket = io.sockets.sockets.get(socketId);
+                if (zombieSocket) {
+                    zombieSocket.disconnect(true); // This triggers the 'disconnect' event → cleanup timer
+                }
+            } catch (e) {
+                console.error(`💀 [Zombie] Failed to disconnect socket ${socketId}:`, e);
+            }
+        }
+
+        // --- PHASE 3: Clean users with no socket at all ---
         for (const { userId, roomId } of deadUsers) {
             voiceHeartbeats.delete(userId);
 
@@ -968,12 +1123,40 @@ function startHeartbeatSweep(io, db, admin, voicePresence, roomService) {
             await cleanupUserFromRoom(userId, roomId, io, db, admin, voicePresence, roomService);
         }
 
-        if (deadUsers.length > 0) {
-            console.log(`💓 Heartbeat sweep complete: cleaned ${deadUsers.length} ghost user(s)`);
+        // --- PHASE 4: Also run purgeGhostsFromRAM for ALL cached rooms ---
+        // This catches ghost players who were loaded from Firestore into RAM
+        // but never registered a heartbeat (e.g., from a previous server session).
+        for (const [roomId] of activeRoomRAM.entries()) {
+            purgeGhostsFromRAM(roomId, voicePresence);
+        }
+
+        const totalCleaned = deadUsers.length + zombieSockets.length;
+        if (totalCleaned > 0) {
+            console.log(`💓 Heartbeat sweep complete: ${deadUsers.length} dead, ${zombieSockets.length} zombie socket(s) force-disconnected`);
         }
     }, SWEEP_INTERVAL_MS);
 
     console.log('💓 Heartbeat sweep started (every 1 minute)');
 }
 
-module.exports = { registerVoiceRoomHandlers, startHeartbeatSweep, activeRoomRAM };
+// --- FIX 3: Invalidate RAM cache for a specific room ---
+// Call this when you manually edit Firestore (admin panel, manual cleanup, etc.)
+// Forces the next getRoomState() to read fresh from Firestore.
+function invalidateRoomRAM(roomId) {
+    if (activeRoomRAM.has(roomId)) {
+        activeRoomRAM.delete(roomId);
+        console.log(`🗑️ [RAM Invalidate] Cleared RAM cache for room ${roomId}`);
+        return true;
+    }
+    return false;
+}
+
+// Invalidate ALL rooms (useful after bulk admin cleanup)
+function invalidateAllRoomRAM() {
+    const count = activeRoomRAM.size;
+    activeRoomRAM.clear();
+    console.log(`🗑️ [RAM Invalidate] Cleared ALL ${count} rooms from RAM cache`);
+    return count;
+}
+
+module.exports = { registerVoiceRoomHandlers, startHeartbeatSweep, activeRoomRAM, invalidateRoomRAM, invalidateAllRoomRAM };

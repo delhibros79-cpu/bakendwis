@@ -24,7 +24,7 @@ const { registerTicTacToeHandlers } = require('./ticTacToeServer');
 const { registerJakaroHandlers } = require('./jakaroGameServer');
 
 const { runGameOrchestrator } = require('./gameOrchestrator');
-const { registerVoiceRoomHandlers, startHeartbeatSweep, activeRoomRAM } = require('./voiceRoomHandler');
+const { registerVoiceRoomHandlers, startHeartbeatSweep, activeRoomRAM, invalidateRoomRAM, invalidateAllRoomRAM } = require('./voiceRoomHandler');
 const { setupLudoRoutes } = require('./ludoHandler');
 const { setupCoinSellerRoutes } = require('./coinSellerHandler');
 const datingRouter = require('./datingHandler');
@@ -2812,6 +2812,25 @@ startFruitGreedyGameLoop(io, db, admin);
 
 // Start the heartbeat sweep to detect ghost players (app killed, network drop)
 startHeartbeatSweep(io, db, admin, voicePresence, roomService);
+
+// --- FIX 3: Admin API to invalidate RAM cache after manual Firestore edits ---
+// Use this AFTER you manually delete ghost players from the database.
+// POST /api/admin/invalidate-room-ram  { adminPassword: '7076', roomId: 'xxx' }
+// POST /api/admin/invalidate-all-room-ram  { adminPassword: '7076' }
+app.post('/api/admin/invalidate-room-ram', (req, res) => {
+    const { adminPassword, roomId } = req.body;
+    if (adminPassword !== '7076') return res.status(403).json({ error: 'Unauthorized' });
+    if (!roomId) return res.status(400).json({ error: 'roomId is required' });
+    const cleared = invalidateRoomRAM(roomId);
+    res.json({ success: true, cleared, message: cleared ? `RAM cache cleared for room ${roomId}` : `Room ${roomId} was not in RAM cache` });
+});
+
+app.post('/api/admin/invalidate-all-room-ram', (req, res) => {
+    const { adminPassword } = req.body;
+    if (adminPassword !== '7076') return res.status(403).json({ error: 'Unauthorized' });
+    const count = invalidateAllRoomRAM();
+    res.json({ success: true, clearedCount: count, message: `Cleared ${count} rooms from RAM cache` });
+});
 
 // --- GLOBAL ADMIN BROADCAST DM ---
 app.post('/api/admin/broadcast-dm', async (req, res) => {
